@@ -31,7 +31,12 @@ class Settings(BaseSettings):
 
     # Download Configuration
     download_dir: Path = Field(
-        default=Path("downloads"), description="Download directory"
+        default=(
+            Path(tempfile.gettempdir()) / "downloads"
+            if "VERCEL" in os.environ
+            else Path("downloads")
+        ),
+        description="Download directory",
     )
     max_concurrent_downloads: int = Field(
         default=5, description="Max concurrent downloads"
