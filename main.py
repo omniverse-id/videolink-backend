@@ -35,6 +35,24 @@ from security import RateLimitMiddleware, SecurityValidator, APIKeyAuth
 
 # Database import removed - no longer using database
 
+# --- VERCEL YTDLP CONFIGURATION FIX ---
+# Asumsi binary 'yt-dlp' diletakkan di folder 'bin' pada root project backend
+try:
+    # Tentukan path absolut untuk binary
+    YTDLP_BIN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "yt-dlp")
+    
+    # Set izin eksekusi (penting di lingkungan Linux serverless)
+    if os.path.exists(YTDLP_BIN_PATH):
+        os.chmod(YTDLP_BIN_PATH, 0o755)
+        YTDLP_CMD = YTDLP_BIN_PATH
+    else:
+        YTDLP_CMD = "yt-dlp" # Fallback jika binary tidak ditemukan di path yang diharapkan
+        
+except Exception:
+    YTDLP_CMD = "yt-dlp"
+    # Logging ini akan muncul jika setup path gagal.
+# --- END VERCEL YTDLP CONFIGURATION ---
+
 # Configure enhanced logging
 if settings.structured_logging:
     import structlog
@@ -420,7 +438,7 @@ def check_browser_available(browser: str = DEFAULT_BROWSER) -> bool:
     try:
         # Use direct command execution to test if browser cookies can be extracted
         cmd = [
-            "yt-dlp",
+            YTDLP_CMD, # MENGGUNAKAN VARIABEL GLOBAL
             "--cookies-from-browser",
             browser,
             "--skip-download",
@@ -673,182 +691,6 @@ def cleanup_cookie_file(options: dict):
             logger.warning(f"Error cleaning up cookie file: {e}")
 
 
-@app.post("/api/cookies", response_model=CookieStatusResponse)
-async def upload_cookies(cookies: CookieUpload):
-    """
-    Upload cookies from the client browser to be used for video downloads.
-    This is particularly useful for age-restricted videos on YouTube.
-    """
-    try:
-        # Validate cookies
-        if not cookies.cookies or len(cookies.cookies) == 0:
-            return CookieStatusResponse(
-                browser_cookies_available=check_browser_available(DEFAULT_BROWSER),
-                client_cookies_supported=True,
-                message="No cookies provided",
-            )
-
-        # Create a test cookie file to verify
-        test_id = f"test_{uuid.uuid4()}"
-        cookie_file = cookie_manager.create_cookie_file(cookies.cookies, test_id)
-
-        # Clean up test file
-        cookie_manager.delete_cookie_file(cookie_file)
-
-        return CookieStatusResponse(
-            browser_cookies_available=check_browser_available(DEFAULT_BROWSER),
-            client_cookies_supported=True,
-            message=f"Successfully processed {len(cookies.cookies)} cookies",
-        )
-    except Exception as e:
-        logger.error(f"Error processing uploaded cookies: {e}")
-        return CookieStatusResponse(
-            browser_cookies_available=check_browser_available(DEFAULT_BROWSER),
-            client_cookies_supported=True,
-            message=f"Error processing cookies: {str(e)}",
-        )
-
-
-# Helper functions for streaming downloads
-def sanitize_filename(filename: str) -> str:
-    """Remove invalid characters from filename."""
-    # Remove invalid filename characters
-    invalid_chars = '<>:"/\\|?*'
-    for char in invalid_chars:
-        filename = filename.replace(char, "_")
-
-    # Remove extra spaces and truncate if too long
-    filename = " ".join(filename.split())
-    return filename[:100] if len(filename) > 100 else filename
-
-
-def get_extension_from_format(
-    format_code: str, extract_audio: bool, audio_format: str
-) -> str:
-    """Determine file extension based on format selection."""
-    if extract_audio:
-        return audio_format or "mp3"
-
-    # Common video format mappings
-    format_extensions = {
-        "18": "mp4",  # 360p MP4
-        "22": "mp4",  # 720p MP4
-        "137": "mp4",  # 1080p MP4
-        "best": "mp4",
-        "worst": "mp4",
-        "bestvideo": "mp4",
-        "bestaudio": "m4a",
-    }
-
-    return format_extensions.get(format_code, "mp4")
-
-
-def get_content_type(extension: str) -> str:
-    """Get MIME type for file extension."""
-    content_types = {
-        "mp4": "video/mp4",
-        "webm": "video/webm",
-        "mkv": "video/x-matroska",
-        "avi": "video/x-msvideo",
-        "mp3": "audio/mpeg",
-        "m4a": "audio/mp4",
-        "ogg": "audio/ogg",
-        "wav": "audio/wav",
-    }
-    return content_types.get(extension, "application/octet-stream")
-
-
-def get_streaming_ytdlp_options(request: DownloadRequest, task_id: str) -> dict:
-    """Generate yt-dlp options for streaming downloads."""
-    chosen_format = request.format
-
-    # Smart audio extraction logic (same as main function)
-    extract_audio_postprocessor = False
-    if request.extract_audio:
-        if chosen_format == "best" or chosen_format == "":
-            # User wants to extract audio but didn't specify format - use bestaudio + convert
-            chosen_format = "bestaudio"
-            extract_audio_postprocessor = True
-        else:
-            # User selected a specific format
-            # Check if it's a known audio-only format
-            audio_only_formats = {
-                "140",
-                "141",
-                "171",
-                "250",
-                "251",
-                "249",
-                "139",
-                "138",
-                "bestaudio",
-                "worstaudio",
-            }
-
-            if chosen_format in audio_only_formats:
-                # It's already audio-only, no need for post-processing
-                extract_audio_postprocessor = False
-                logger.info(
-                    f"Streaming: Using audio-only format {chosen_format} directly"
-                )
-            else:
-                # It's a video format, so we need to extract audio
-                extract_audio_postprocessor = True
-                logger.info(
-                    f"Streaming: Using video format {chosen_format} with audio extraction"
-                )
-
-    logger.info(
-        f"Streaming final format: {chosen_format}, Extract audio: {extract_audio_postprocessor}"
-    )
-
-    options = {
-        "format": chosen_format,
-        "quiet": False,
-        "no_warnings": False,
-        "retries": 3,
-        "fragment_retries": 3,
-        "socket_timeout": 30,
-        "postprocessors": [],
-        "overwrites": True,  # Always overwrite existing files
-        "continue_dl": False,  # Don't continue partial downloads
-        "nopart": True,  # Don't use .part files
-        "force_overwrites": True,  # Force overwrite even if file exists
-        "no_check_certificate": False,  # Keep certificate checks
-        "cachedir": False,  # Disable caching to prevent conflicts
-        "break_on_existing": False,  # CRITICAL: Don't skip downloads for existing files
-        "download_archive": None,  # CRITICAL: Disable download archive completely
-    }
-
-    # Get cookie arguments
-    cookie_args, cookie_file = get_yt_dlp_base_args(
-        request.use_browser_cookies, request.client_cookies, task_id
-    )
-
-    # Add cookie arguments to options
-    if "--cookies" in cookie_args:
-        options["cookies"] = cookie_args[cookie_args.index("--cookies") + 1]
-    elif "--cookies-from-browser" in cookie_args:
-        options["cookiesfrombrowser"] = (
-            cookie_args[cookie_args.index("--cookies-from-browser") + 1],
-            None,
-            None,
-            None,
-        )
-
-    # Extract audio if requested (only if we determined post-processing is needed)
-    if extract_audio_postprocessor:
-        options["postprocessors"].append(
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": request.audio_format or "mp3",
-                "preferredquality": request.quality or "0",
-            }
-        )
-
-    return options
-
-
 @app.post("/api/download/stream")
 async def stream_download(
     request: DownloadRequest,
@@ -872,7 +714,7 @@ async def stream_download(
 
     # Get video info first to determine filename and content type
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "outtmpl": os.devnull}) as ydl: # os.devnull to prevent writing files during info extraction
             info = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: ydl.extract_info(str(validated_url), download=False)
             )
@@ -891,78 +733,6 @@ async def stream_download(
         async def download_generator():
             temp_dir = None
             try:
-                # Create temporary directory for download
-                temp_dir = tempfile.mkdtemp()
-
-                # Set output template with proper extension
-                if request.extract_audio:
-                    # For audio extraction, let yt-dlp handle the extension after post-processing
-                    output_template = os.path.join(
-                        temp_dir, f"{sanitize_filename(filename)}.%(ext)s"
-                    )
-                else:
-                    # For video, use the determined extension
-                    output_template = os.path.join(temp_dir, safe_filename)
-
-                options["outtmpl"] = output_template
-
-                logger.info(f"Downloading to: {output_template}")
-                logger.info(f"Options: {options}")
-
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: ydl.download([str(validated_url)])
-                    )
-
-                # Find the actual downloaded file(s)
-                downloaded_files = []
-                for file_path in os.listdir(temp_dir):
-                    full_path = os.path.join(temp_dir, file_path)
-                    if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
-                        downloaded_files.append(full_path)
-
-                if not downloaded_files:
-                    raise Exception("No valid files were downloaded")
-
-                # Use the first (and usually only) downloaded file
-                download_path = downloaded_files[0]
-                actual_filename = os.path.basename(download_path)
-
-                logger.info(
-                    f"Found downloaded file: {actual_filename} ({os.path.getsize(download_path)} bytes)"
-                )
-
-                # Update filename and content type based on actual file
-                actual_ext = os.path.splitext(actual_filename)[1][1:]  # Remove the dot
-                if actual_ext:
-                    content_type = get_content_type(actual_ext)
-
-                # Stream the file back
-                with open(download_path, "rb") as f:
-                    while chunk := f.read(8192):  # 8KB chunks
-                        yield chunk
-
-            except Exception as e:
-                logger.error(f"Error in download generator: {e}")
-                error_msg = f"Download failed: {str(e)}"
-                yield error_msg.encode("utf-8")
-            finally:
-                # Clean up temp directory and all files
-                if temp_dir and os.path.exists(temp_dir):
-                    try:
-                        shutil.rmtree(temp_dir)
-                        logger.info(f"Cleaned up temp directory: {temp_dir}")
-                    except Exception as e:
-                        logger.warning(f"Failed to clean up temp directory: {e}")
-
-        # We need to determine the actual filename after download, so let's create a wrapper
-        actual_filename = safe_filename
-        actual_content_type = content_type
-
-        async def filename_aware_generator():
-            nonlocal actual_filename, actual_content_type
-            temp_dir = None
-            try:
                 # Create unique temporary directory for download
                 temp_dir = tempfile.mkdtemp(prefix=f"ytdlp_stream_{task_id}_")
 
@@ -975,9 +745,9 @@ async def stream_download(
                     )
                 else:
                     # For video, use the determined extension with unique ID
-                    base_name, ext = os.path.splitext(safe_filename)
+                    base_name, ext_part = os.path.splitext(safe_filename)
                     output_template = os.path.join(
-                        temp_dir, f"{base_name}_{unique_id}{ext}"
+                        temp_dir, f"{base_name}_{unique_id}{ext_part}"
                     )
 
                 options["outtmpl"] = output_template
@@ -1043,7 +813,7 @@ async def stream_download(
                         yield chunk
 
             except Exception as e:
-                logger.error(f"Error in download: {e}")
+                logger.error(f"Error in download generator: {e}")
                 error_msg = f"Download failed: {str(e)}"
                 yield error_msg.encode("utf-8")
             finally:
@@ -1055,8 +825,12 @@ async def stream_download(
                     except Exception as e:
                         logger.warning(f"Failed to clean up temp directory: {e}")
 
+        # We need to determine the actual filename after download, so let's create a wrapper
+        actual_filename = safe_filename
+        actual_content_type = content_type
+
         return StreamingResponse(
-            filename_aware_generator(),
+            download_generator(),
             media_type=actual_content_type,
             headers={
                 "Content-Disposition": f'attachment; filename="{actual_filename}"',
@@ -1082,8 +856,9 @@ async def health_check():
     # Check if yt-dlp is working
     ytdlp_healthy = True
     try:
+        # --- PERBAIKAN VERCEL YTDLP: Mengganti "yt-dlp" dengan YTDLP_CMD ---
         result = subprocess.run(
-            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=5
+            [YTDLP_CMD, "--version"], capture_output=True, text=True, timeout=5
         )
         ytdlp_version = result.stdout.strip() if result.returncode == 0 else "unknown"
     except Exception:
@@ -1232,10 +1007,10 @@ async def _get_video_info(
             )
             logger.info(f"Using browser cookies: {options['cookiesfrombrowser'][0]}")
 
-        # Direct subprocess call with cookies for maximum compatibility
+        # Use direct subprocess call with cookies for maximum compatibility
         try:
             # First try direct subprocess call with cookies for maximum compatibility
-            cmd = ["yt-dlp", "--dump-json", "--no-warnings", "--quiet"]
+            cmd = [YTDLP_CMD, "--dump-json", "--no-warnings", "--quiet"] # MENGGANTI "yt-dlp"
             if not is_playlist:
                 cmd.append("--no-playlist")
 
@@ -1443,7 +1218,7 @@ async def _get_formats(
         try:
             # First try direct subprocess call with cookies for maximum compatibility
             cmd = [
-                "yt-dlp",
+                YTDLP_CMD, # MENGGANTI "yt-dlp"
                 "--dump-json",
                 "--no-warnings",
                 "--quiet",
@@ -1538,7 +1313,8 @@ async def get_browser_status():
     browser_info = ""
     try:
         if browser == "chrome" or browser == "chromium":
-            cmd = ["google-chrome", "--version"]
+            # --- PERBAIKAN VERCEL YTDLP: Mengganti "yt-dlp" dengan YTDLP_CMD ---
+            cmd = [YTDLP_CMD, "--version"]
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 browser_info = result.stdout.strip()
